@@ -15,7 +15,7 @@ pub fn bytes_to_string(encoding: &CodedCharacterSet, bytes: &[u8]) -> String {
         .iter()
         .filter_map(|&byte| encoding[byte as usize])
         .collect::<Vec<u16>>();
-    String::from_utf16(&code_points).expect("decoded string should only contain valid UTF16")
+    String::from_utf16_lossy(&code_points)
 }
 
 pub fn string_to_bytes(encoding: &CodedCharacterSet, text: &str) -> Vec<u8> {
@@ -27,11 +27,11 @@ pub fn string_to_bytes(encoding: &CodedCharacterSet, text: &str) -> Vec<u8> {
 
 pub enum Encoding<'a> {
     OneByteEncoding(&'a CodedCharacterSet),
-    SimpleEncoding(&'a [u8]),
+    SimpleEncoding(&'a str),
     UnicodeMapEncoding(ToUnicodeCMap),
 }
 
-impl std::fmt::Debug for Encoding<'_> {
+impl<'a> std::fmt::Debug for Encoding<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             // UnicodeCMap and Bytes encoding ommitted to not bloat debug log
@@ -42,11 +42,11 @@ impl std::fmt::Debug for Encoding<'_> {
     }
 }
 
-impl Encoding<'_> {
+impl<'a> Encoding<'a> {
     pub fn bytes_to_string(&self, bytes: &[u8]) -> Result<String> {
         match self {
             Self::OneByteEncoding(map) => Ok(bytes_to_string(map, bytes)),
-            Self::SimpleEncoding(b"UniGB-UCS2-H") | Self::SimpleEncoding(b"UniGB-UTF16-H") => {
+            Self::SimpleEncoding(name) if ["UniGB-UCS2-H", "UniGB−UTF16−H"].contains(name) => {
                 Ok(UTF_16BE.decode(bytes).0.to_string())
             }
             Self::UnicodeMapEncoding(unicode_map) => {
@@ -81,14 +81,14 @@ impl Encoding<'_> {
                     .collect();
                 Ok(UTF_16BE.decode(&utf16_str).0.to_string())
             }
-            Self::SimpleEncoding(_) => Err(Error::CharacterEncoding),
+            Self::SimpleEncoding(_) => Err(Error::ContentDecode),
         }
     }
 
     pub fn string_to_bytes(&self, text: &str) -> Vec<u8> {
         match self {
             Self::OneByteEncoding(map) => string_to_bytes(map, text),
-            Self::SimpleEncoding(b"UniGB-UCS2-H") | Self::SimpleEncoding(b"UniGB-UTF16-H") => encode_utf16_be(text),
+            Self::SimpleEncoding(name) if ["UniGB-UCS2-H", "UniGB-UTF16-H"].contains(name) => encode_utf16_be(text),
             Self::UnicodeMapEncoding(_unicode_map) => {
                 // maybe only possible if the unicode map is an identity?
                 unimplemented!()
@@ -122,24 +122,4 @@ pub fn encode_utf8(text: &str) -> Vec<u8> {
     let mut bytes = vec![0xEF, 0xBB, 0xBF];
     bytes.extend(text.bytes());
     bytes
-}
-
-#[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    #[test]
-    fn unicode_with_2byte_code_does_not_convert_single_bytes() {
-        let mut cmap = ToUnicodeCMap::new();
-
-        cmap.put(0x0000, 0x0002, 2, cmap::BfRangeTarget::UTF16CodePoint { offset: 0 });
-        cmap.put(0x0024, 0x0025, 2, cmap::BfRangeTarget::UTF16CodePoint { offset: 0 });
-
-        let bytes: [u8; 2] = [0x00, 0x24];
-
-        let result = Encoding::UnicodeMapEncoding(cmap).bytes_to_string(&bytes);
-
-        assert_eq!(result.unwrap(), "\u{0024}");
-    }
 }

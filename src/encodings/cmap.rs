@@ -1,10 +1,10 @@
+use crate::cmap_parser::parse;
 use crate::cmap_section::{CMapParseError, CMapSection, CodeLen, SourceCode};
-use crate::parser::cmap_parser::parse;
 use crate::parser::ParserInput;
 
 use log::error;
 use rangemap::RangeInclusiveMap;
-use thiserror::Error;
+use std::fmt;
 
 /// Unicode Cmap is implemented by 4 maps.
 /// Each map contains a mappings from source codes to unicode values for a different length of codes.
@@ -16,14 +16,21 @@ pub struct ToUnicodeCMap {
     bf_ranges: [RangeInclusiveMap<SourceCode, BfRangeTarget>; 4],
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum UnicodeCMapError {
-    #[error("could not parse ToUnicode CMap: {0:#?}")]
     Parse(CMapParseError),
-    #[error("invalid code range")]
     InvalidCodeRange,
 }
 
+impl fmt::Display for UnicodeCMapError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use UnicodeCMapError::*;
+        match self {
+            Parse(cmap_parse_error) => write!(f, "Could not parse ToUnicodeCMap: {:#?}!", cmap_parse_error),
+            InvalidCodeRange => write!(f, "Invalid code range given!"),
+        }
+    }
+}
 impl From<CMapParseError> for UnicodeCMapError {
     fn from(err: CMapParseError) -> Self {
         UnicodeCMapError::Parse(err)
@@ -89,13 +96,13 @@ impl ToUnicodeCMap {
         let bf_ranges_map = &self.bf_ranges[(code_len - 1) as usize];
 
         bf_ranges_map.get_key_value(&code).map(|(range, value)| match value {
-            HexString(vec) => {
+            HexString(ref vec) => {
                 let mut ret_vec = vec.clone();
                 *(ret_vec.last_mut().unwrap()) += (code - range.start()) as u16;
                 ret_vec
             }
             UTF16CodePoint { offset } => vec![u32::wrapping_add(code, *offset) as u16],
-            ArrayOfHexStrings(vec_of_strings) => vec_of_strings[(code - range.start()) as usize].clone(),
+            ArrayOfHexStrings(ref vec_of_strings) => vec_of_strings[(code - range.start()) as usize].clone(),
         })
     }
 

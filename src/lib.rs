@@ -1,48 +1,37 @@
-#![doc = include_str!("../README.md")]
-#![forbid(unsafe_code)]
-#![deny(clippy::all)]
-
-pub mod content;
-pub mod encryption;
-pub mod filters;
-pub mod xobject;
-pub mod xref;
-
 #[macro_use]
 mod object;
+pub use crate::object::{Dictionary, Object, ObjectId, Stream, StringFormat};
+
+mod common_data_structures;
 mod document;
 mod incremental_document;
+mod object_stream;
+pub use object_stream::ObjectStream;
+pub mod xref;
+pub use crate::common_data_structures::{decode_text_string, text_string};
+pub use crate::document::Document;
+pub use crate::encodings::{encode_utf16_be, encode_utf8};
+pub use crate::incremental_document::IncrementalDocument;
 
 mod bookmarks;
+pub use crate::bookmarks::Bookmark;
+#[path = "nom_cmap_parser.rs"]
+mod cmap_parser;
 mod cmap_section;
-mod common_data_structures;
-mod creator;
-mod datetime;
-mod destinations;
+pub mod content;
 mod encodings;
+pub use encodings::Encoding;
+pub mod encryption;
 mod error;
-mod outlines;
-mod processor;
-mod rc4;
-mod toc;
-mod writer;
-
-mod object_stream;
+pub use error::XrefError;
+pub mod filters;
+#[path = "nom_parser.rs"]
 mod parser;
 mod parser_aux;
+mod processor;
 mod reader;
-
-pub use document::Document;
-pub use object::{Dictionary, Object, ObjectId, Stream, StringFormat};
-
-pub use bookmarks::Bookmark;
-pub use common_data_structures::{decode_text_string, text_string};
-pub use destinations::Destination;
-pub use encodings::{encode_utf16_be, encode_utf8, Encoding};
-pub use error::{Error, Result};
-pub use incremental_document::IncrementalDocument;
-pub use object_stream::ObjectStream;
-pub use outlines::Outline;
-#[cfg(feature = "nom_parser")]
 pub use reader::Reader;
-pub use toc::Toc;
+mod rc4;
+pub mod xobject;
+
+pub use error::{Error, Result};

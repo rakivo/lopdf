@@ -1,9 +1,16 @@
+// object.rs
+// cmap_parser.rs
+// cmap_section.rs
+// bookmarks.rs
+// encoding
+// encryption
+// xobject
+// xref
+
 use super::encodings::Encoding;
 use super::{Bookmark, Dictionary, Object, ObjectId};
-use crate::encryption;
-use crate::xobject::PdfImage;
 use crate::xref::{Xref, XrefType};
-use crate::{Error, Result, Stream};
+use crate::{Error, Result};
 use log::debug;
 use std::cmp::max;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -133,7 +140,7 @@ impl Document {
 
         while let Ok(ref_id) = object.as_reference() {
             id = Some(ref_id);
-            object = self.objects.get(&ref_id).ok_or(Error::ObjectNotFound(ref_id))?;
+            object = self.objects.get(&ref_id).ok_or(Error::ObjectNotFound)?;
 
             nb_deref += 1;
             if nb_deref > Self::DEREF_LIMIT {
@@ -146,7 +153,7 @@ impl Document {
 
     /// Get object by object id, will iteratively dereference a referenced object.
     pub fn get_object(&self, id: ObjectId) -> Result<&Object> {
-        let object = self.objects.get(&id).ok_or(Error::ObjectNotFound(id))?;
+        let object = self.objects.get(&id).ok_or(Error::ObjectNotFound)?;
         self.dereference(object).map(|(_, object)| object)
     }
 
@@ -159,26 +166,31 @@ impl Document {
 
     /// Get mutable reference to object by object ID, will iteratively dereference a referenced object.
     pub fn get_object_mut(&mut self, id: ObjectId) -> Result<&mut Object> {
-        let object = self.objects.get(&id).ok_or(Error::ObjectNotFound(id))?;
+        let object = self.objects.get(&id).ok_or(Error::ObjectNotFound)?;
         let (ref_id, _obj) = self.dereference(object)?;
 
         Ok(self.objects.get_mut(&ref_id.unwrap_or(id)).unwrap())
     }
 
-    /// Get the object ID of the page that contains `id`.
+    /// Get page object_id of the specified object object_id
     pub fn get_object_page(&self, id: ObjectId) -> Result<ObjectId> {
         for (_, object_id) in self.get_pages() {
             let page = self.get_object(object_id)?.as_dict()?;
             let annots = page.get(b"Annots")?.as_array()?;
             let mut objects_ids = annots.iter().map(Object::as_reference);
 
-            let contains = objects_ids.any(|object_id| Some(id) == object_id.ok());
+            let contains = objects_ids.any(|object_id| {
+                if let Ok(object_id) = object_id {
+                    return id == object_id;
+                }
+                false
+            });
             if contains {
                 return Ok(object_id);
             }
         }
 
-        Err(Error::PageNumberNotFound(0))
+        Err(Error::ObjectNotFound)
     }
 
     /// Get dictionary object by id.
@@ -196,10 +208,7 @@ impl Document {
         match node.get(key)? {
             Object::Reference(object_id) => self.get_dictionary(*object_id),
             Object::Dictionary(dic) => Ok(dic),
-            obj => Err(Error::ObjectType {
-                expected: "Dictionary",
-                found: obj.enum_variant(),
-            }),
+            _ => Err(Error::Type),
         }
     }
 
@@ -217,13 +226,13 @@ impl Document {
         }
         fn traverse_object<A: Fn(&mut Object)>(object: &mut Object, action: &A, refs: &mut Vec<ObjectId>) {
             action(object);
-            match object {
-                Object::Array(array) => traverse_array(array, action, refs),
-                Object::Dictionary(dict) => traverse_dictionary(dict, action, refs),
-                Object::Stream(stream) => traverse_dictionary(&mut stream.dict, action, refs),
+            match *object {
+                Object::Array(ref mut array) => traverse_array(array, action, refs),
+                Object::Dictionary(ref mut dict) => traverse_dictionary(dict, action, refs),
+                Object::Stream(ref mut stream) => traverse_dictionary(&mut stream.dict, action, refs),
                 Object::Reference(id) => {
-                    if !refs.contains(id) {
-                        refs.push(*id);
+                    if !refs.contains(&id) {
+                        refs.push(id);
                     }
                 }
                 _ => {}
@@ -252,74 +261,6 @@ impl Document {
     /// Return true is PDF document is encrypted
     pub fn is_encrypted(&self) -> bool {
         self.get_encrypted().is_ok()
-    }
-
-    /// Replaces all encrypted Strings and Streams with their decrypted contents
-    pub fn decrypt<P: AsRef<[u8]>>(&mut self, password: P) -> Result<()> {
-        // Find the ID of the encryption dict; we'll want to skip it when decrypting
-        let encryption_obj_id = self.trailer.get(b"Encrypt").and_then(Object::as_reference)?;
-
-        // Since PDF 1.5, metadata may or may not be encrypted; defaults to true
-        let metadata_is_encrypted = self
-            .get_object(encryption_obj_id)?
-            .as_dict()?
-            .get(b"EncryptMetadata")
-            .and_then(|o| o.as_bool())
-            .unwrap_or(true);
-
-        let key = encryption::get_encryption_key(self, &password, true)?;
-        let cfm = self
-            .get_encrypted()?
-            .get(b"CF")?
-            .as_dict()?
-            .get(b"StdCF")?
-            .as_dict()?
-            .get(b"CFM")?
-            .as_name()
-            .unwrap_or_default();
-        let is_aes = cfm == b"AESV2";
-        for (&id, obj) in self.objects.iter_mut() {
-            // The encryption dictionary is not encrypted, leave it alone
-            if id == encryption_obj_id {
-                continue;
-            }
-
-            // If a Metadata stream but metadata isn't encrypted, leave it alone
-            if obj.type_name().ok() == Some(b"Metadata") && !metadata_is_encrypted {
-                continue;
-            }
-
-            let decrypted = match encryption::decrypt_object(&key, id, &*obj, is_aes) {
-                Ok(content) => content,
-                Err(encryption::DecryptionError::NotDecryptable) => {
-                    continue;
-                }
-                Err(_err) => {
-                    return Err(_err.into());
-                }
-            };
-
-            // Only strings and streams are encrypted
-            match obj {
-                Object::Stream(stream) => stream.set_content(decrypted),
-                Object::String(content, _) => *content = decrypted,
-                _ => {}
-            }
-        }
-
-        if let Ok(info_obj_id) = self.trailer.get(b"Info").and_then(Object::as_reference) {
-            if let Ok(info_dict) = self.get_object_mut(info_obj_id).and_then(Object::as_dict_mut) {
-                for (_, info_obj) in info_dict.iter_mut() {
-                    if let Ok(content) = encryption::decrypt_object(&key, info_obj_id, &*info_obj, is_aes) {
-                        info_obj.as_str_mut()?.clear();
-                        info_obj.as_str_mut()?.extend(content);
-                    };
-                }
-            }
-        }
-
-        self.trailer.remove(b"Encrypt");
-        Ok(())
     }
 
     /// Return the PDF document catalog, which is the root of the document's object graph.
@@ -353,14 +294,14 @@ impl Document {
         let mut streams = vec![];
         if let Ok(page) = self.get_dictionary(page_id) {
             let mut nb_deref = 0;
-            // Since we're looking for object IDs, we can't use get_deref
+            // Since we're looking for object ids, we can't use get_deref
             // so manually walk any references in contents object
             if let Ok(mut contents) = page.get(b"Contents") {
                 loop {
-                    match contents {
-                        Object::Reference(id) => match self.objects.get(id) {
+                    match *contents {
+                        Object::Reference(id) => match self.objects.get(&id) {
                             None | Some(Object::Stream(_)) => {
-                                streams.push(*id);
+                                streams.push(id);
                             }
                             Some(o) => {
                                 nb_deref += 1;
@@ -370,7 +311,7 @@ impl Document {
                                 }
                             }
                         },
-                        Object::Array(arr) => {
+                        Object::Array(ref arr) => {
                             for content in arr {
                                 if let Ok(id) = content.as_reference() {
                                     streams.push(id)
@@ -384,24 +325,6 @@ impl Document {
             }
         }
         streams
-    }
-
-    /// Add content to a page. All existing content will be unchanged.
-    pub fn add_page_contents(&mut self, page_id: ObjectId, content: Vec<u8>) -> Result<()> {
-        let page = self.get_dictionary(page_id)?;
-        let mut current_content_list: Vec<Object> = match page.get(b"Contents") {
-            Ok(Object::Reference(id)) => {
-                vec![Object::Reference(*id)]
-            }
-            Ok(Object::Array(arr)) => arr.clone(),
-            _ => vec![],
-        };
-        let content_object_id = self.add_object(Object::Stream(Stream::new(Dictionary::new(), content)));
-        current_content_list.push(Object::Reference(content_object_id));
-
-        let page_mut = self.get_object_mut(page_id).and_then(Object::as_dict_mut)?;
-        page_mut.set("Contents", current_content_list);
-        Ok(())
     }
 
     /// Get content of a page.
@@ -430,7 +353,7 @@ impl Document {
             }
             if let Ok(parent_id) = page_node.get(b"Parent").and_then(Object::as_reference) {
                 if already_seen.contains(&parent_id) {
-                    return Err(Error::ReferenceCycle(parent_id));
+                    return Err(Error::ReferenceCycle);
                 }
                 already_seen.insert(parent_id);
                 let parent_dict = doc.get_dictionary(parent_id)?;
@@ -455,15 +378,15 @@ impl Document {
         ) {
             if let Ok(font) = resources.get(b"Font") {
                 let font_dict = match font {
-                    Object::Reference(id) => doc.get_object(*id).and_then(Object::as_dict).ok(),
-                    Object::Dictionary(dict) => Some(dict),
+                    Object::Reference(ref id) => doc.get_object(*id).and_then(Object::as_dict).ok(),
+                    Object::Dictionary(ref dict) => Some(dict),
                     _ => None,
                 };
                 if let Some(font_dict) = font_dict {
                     for (name, value) in font_dict.iter() {
-                        let font = match value {
-                            Object::Reference(id) => doc.get_dictionary(*id).ok(),
-                            Object::Dictionary(dict) => Some(dict),
+                        let font = match *value {
+                            Object::Reference(id) => doc.get_dictionary(id).ok(),
+                            Object::Dictionary(ref dict) => Some(dict),
                             _ => None,
                         };
                         if !fonts.contains_key(name) {
@@ -494,14 +417,14 @@ impl Document {
         let mut annotations = vec![];
         if let Ok(page) = self.get_dictionary(page_id) {
             match page.get(b"Annots") {
-                Ok(Object::Reference(id)) => self
+                Ok(Object::Reference(ref id)) => self
                     .get_object(*id)
                     .and_then(Object::as_array)?
                     .iter()
                     .flat_map(Object::as_reference)
                     .flat_map(|id| self.get_dictionary(id))
                     .for_each(|a| annotations.push(a)),
-                Ok(Object::Array(a)) => a
+                Ok(Object::Array(ref a)) => a
                     .iter()
                     .flat_map(Object::as_reference)
                     .flat_map(|id| self.get_dictionary(id))
@@ -510,64 +433,6 @@ impl Document {
             }
         }
         Ok(annotations)
-    }
-
-    pub fn get_page_images(&self, page_id: ObjectId) -> Result<Vec<PdfImage>> {
-        let mut images = vec![];
-        if let Ok(page) = self.get_dictionary(page_id) {
-            let resources = self.get_dict_in_dict(page, b"Resources")?;
-            let xobject = self.get_dict_in_dict(resources, b"XObject")?;
-            for (_, xvalue) in xobject.iter() {
-                let id = xvalue.as_reference()?;
-                let xvalue = self.get_object(id)?;
-                let xvalue = xvalue.as_stream()?;
-                let dict = &xvalue.dict;
-                if dict.get(b"Subtype")?.as_name()? != b"Image" {
-                    continue;
-                }
-                let width = dict.get(b"Width")?.as_i64()?;
-                let height = dict.get(b"Height")?.as_i64()?;
-                let color_space = match dict.get(b"ColorSpace") {
-                    Ok(cs) => match cs {
-                        Object::Array(array) => Some(String::from_utf8_lossy(array[0].as_name()?).to_string()),
-                        Object::Name(name) => Some(String::from_utf8_lossy(name).to_string()),
-                        _ => None,
-                    },
-                    Err(_) => None,
-                };
-                let bits_per_component = match dict.get(b"BitsPerComponent") {
-                    Ok(bpc) => Some(bpc.as_i64()?),
-                    Err(_) => None,
-                };
-                let mut filters = vec![];
-                if let Ok(filter) = dict.get(b"Filter") {
-                    match filter {
-                        Object::Array(array) => {
-                            for obj in array.iter() {
-                                let name = obj.as_name()?;
-                                filters.push(String::from_utf8_lossy(name).to_string());
-                            }
-                        }
-                        Object::Name(name) => {
-                            filters.push(String::from_utf8_lossy(name).to_string());
-                        }
-                        _ => {}
-                    }
-                };
-
-                images.push(PdfImage {
-                    id,
-                    width,
-                    height,
-                    color_space,
-                    bits_per_component,
-                    filters: Some(filters),
-                    content: &xvalue.content,
-                    origin_dict: &xvalue.dict,
-                });
-            }
-        }
-        Ok(images)
     }
 
     pub fn decode_text(encoding: &Encoding, bytes: &[u8]) -> Result<String> {
@@ -641,12 +506,12 @@ impl Iterator for PageTreeIter<'_> {
                 self.kids = Some(new_kids);
 
                 if let Ok(kid_id) = kid.as_reference() {
-                    if let Ok(type_name) = self.doc.get_dictionary(kid_id).and_then(Dictionary::get_type) {
+                    if let Ok(type_name) = self.doc.get_dictionary(kid_id).and_then(Dictionary::type_name) {
                         match type_name {
-                            b"Page" => {
+                            "Page" => {
                                 return Some(kid_id);
                             }
-                            b"Pages" => {
+                            "Pages" => {
                                 if self.stack.len() < Self::PAGE_TREE_DEPTH_LIMIT {
                                     let kids = self.kids.unwrap();
                                     if !kids.is_empty() {
@@ -678,7 +543,7 @@ impl Iterator for PageTreeIter<'_> {
             .chain(self.stack.iter().flat_map(|k| k.iter()))
             .map(|kid| {
                 if let Ok(dict) = kid.as_reference().and_then(|id| self.doc.get_dictionary(id)) {
-                    if let Ok(b"Pages") = dict.get_type() {
+                    if let Ok("Pages") = dict.type_name() {
                         let count = dict.get_deref(b"Count", self.doc).and_then(Object::as_i64).unwrap_or(0);
                         // Don't let page count go backwards in case of an invalid document.
                         max(0, count) as usize
