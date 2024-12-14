@@ -30,7 +30,6 @@ rayon = "1.10.0"
 
 [[example]]
 name = "extract_text"
-required-features = ["serde"]
 
 [badges]
 travis-ci = { repository = "J-F-Liu/lopdf" }
